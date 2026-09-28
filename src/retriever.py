@@ -2,6 +2,7 @@ import os
 import re
 import glob
 import time
+import json
 
 import httpx
 from dotenv import load_dotenv
@@ -10,15 +11,20 @@ from langchain_chroma import Chroma
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 
+
 load_dotenv()  # loads OPENROUTER_API_KEY from .env
 
 DATA_DIR = "data"
 DB_DIR = "chroma_store"
 
+# File used to save embedding results after every successful batch
+EMBEDDING_CHECKPOINT = "embedding_checkpoint.json"
 
-# 0. EMBEDDINGS ---- talks to OpenRouter directly via httpx, bypassing the
-#    openai SDK entirely (no tiktoken pre-tokenization, no auto-injected
-#    OpenAI-Organization/OpenAI-Project headers that were causing the 401s)
+
+# ============================================================
+# 0. EMBEDDINGS
+# ============================================================
+
 class OpenRouterEmbeddings(Embeddings):
 
     def __init__(
@@ -98,11 +104,37 @@ class OpenRouterEmbeddings(Embeddings):
     def embed_documents(self, texts):
 
         batch_size = 50
+
         embeddings = []
 
         total_batches = (
             len(texts) + batch_size - 1
         ) // batch_size
+
+        # ----------------------------------------------------
+        # Load previous checkpoint if it exists
+        # ----------------------------------------------------
+
+        checkpoint = []
+
+        if os.path.exists(EMBEDDING_CHECKPOINT):
+
+            with open(
+                EMBEDDING_CHECKPOINT,
+                "r",
+                encoding="utf-8"
+            ) as f:
+
+                checkpoint = json.load(f)
+
+            print(
+                f"Loaded {len(checkpoint)} "
+                f"previously saved embeddings."
+            )
+
+        # ----------------------------------------------------
+        # Process batches
+        # ----------------------------------------------------
 
         for i in range(0, len(texts), batch_size):
 
@@ -116,72 +148,184 @@ class OpenRouterEmbeddings(Embeddings):
                 f"{len(batch)} texts"
             )
 
+            # ------------------------------------------------
+            # Call OpenRouter
+            # ------------------------------------------------
+
             batch_embeddings = self._post(batch)
 
+            # ------------------------------------------------
+            # Add result to current run
+            # ------------------------------------------------
+
             embeddings.extend(batch_embeddings)
+
+            # ------------------------------------------------
+            # SAVE IMMEDIATELY
+            # ------------------------------------------------
+
+            checkpoint.extend(batch_embeddings)
+
+            with open(
+                EMBEDDING_CHECKPOINT,
+                "w",
+                encoding="utf-8"
+            ) as f:
+
+                json.dump(
+                    checkpoint,
+                    f
+                )
+
+            print(
+                f"Saved {len(batch_embeddings)} "
+                f"embeddings to checkpoint."
+            )
 
         return embeddings
 
     def embed_query(self, text):
+
         return self._post([text])[0]
 
-# 1. LOAD ---- read each transcript, throw away the VTT timestamps
+
+# ============================================================
+# 1. LOAD TRANSCRIPTS
+# ============================================================
+
 def load_transcripts():
 
     docs = []
+
     for path in glob.glob(f"{DATA_DIR}/*.vtt"):
+
         lines = []
-        for line in open(path):
+
+        for line in open(
+            path,
+            encoding="utf-8"
+        ):
+
             line = line.strip()
-            if not line or line == "WEBVTT" or "-->" in line:
+
+            if (
+                not line
+                or line == "WEBVTT"
+                or "-->" in line
+            ):
                 continue
+
             lines.append(line)
+
         text = " ".join(lines)
 
-        session = re.search(r"Session[ _]*(\d+)", path).group(1)
+        session = re.search(
+            r"Session[ _]*(\d+)",
+            path
+        ).group(1)
 
-        docs.append(Document(page_content=text, metadata={"session": session}))
+        docs.append(
+            Document(
+                page_content=text,
+                metadata={
+                    "session": session
+                }
+            )
+        )
 
     return docs
 
 
-# 2. BUILD ---- chunk, embed once, and keep it on disk so we don't re-embed
+# ============================================================
+# 2. BUILD
+# ============================================================
+
 def load_store():
+
     embeddings = OpenRouterEmbeddings(
         model="liquid/lfm-2.5-embedding-350m:free",
-        api_key=os.environ.get("OPENROUTER_API_KEY"),
+        api_key=os.environ.get(
+            "OPENROUTER_API_KEY"
+        ),
     )
 
+    # --------------------------------------------------------
+    # Existing Chroma store
+    # --------------------------------------------------------
+
     if os.path.exists(DB_DIR):
-        return Chroma(persist_directory=DB_DIR, embedding_function=embeddings)
+
+        return Chroma(
+            persist_directory=DB_DIR,
+            embedding_function=embeddings
+        )
+
+    # --------------------------------------------------------
+    # Load transcripts
+    # --------------------------------------------------------
 
     docs = load_transcripts()
 
     if not docs:
+
         raise FileNotFoundError(
-            f"No .vtt files found in '{DATA_DIR}/'. "
-            f"Check that DATA_DIR is correct relative to your current working directory."
+            f"No .vtt files found in '{DATA_DIR}'. "
+            f"Check that DATA_DIR is correct relative "
+            f"to your current working directory."
         )
+
+    # --------------------------------------------------------
+    # Chunk documents
+    # --------------------------------------------------------
 
     chunks = RecursiveCharacterTextSplitter(
         chunk_size=500,
         chunk_overlap=70,
     ).split_documents(docs)
 
-    return Chroma.from_documents(chunks, embeddings, persist_directory=DB_DIR)
+    print(
+        f"Created {len(chunks)} chunks."
+    )
 
+    # --------------------------------------------------------
+    # Create Chroma
+    # --------------------------------------------------------
+
+    return Chroma.from_documents(
+        chunks,
+        embeddings,
+        persist_directory=DB_DIR
+    )
+
+
+# ============================================================
+# 3. RETRIEVER
+# ============================================================
 
 def build_retriever():
-    return load_store().as_retriever(search_kwargs={"k": 5})
+
+    return load_store().as_retriever(
+        search_kwargs={
+            "k": 5
+        }
+    )
 
 
-# 3. TRY IT ---- python src/retriever.py
+# ============================================================
+# 4. TRY IT
+# ============================================================
+
 if __name__ == "__main__":
 
     retriever = build_retriever()
 
-
-    results = retriever.invoke("what is regression testing?")
+    results = retriever.invoke(
+        "what is regression testing?"
+    )
 
     for r in results:
-        print(f"[Session {r.metadata['session']}] {r.page_content[:150]}...\n")
+
+        print(
+            f"[Session {r.metadata['session']}] "
+            f"{r.page_content[:150]}...\n"
+        )
